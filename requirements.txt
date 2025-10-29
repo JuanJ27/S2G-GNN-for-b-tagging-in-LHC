@@ -28,4 +28,5 @@ tqdm==4.64.1
 uproot3==3.14.4
 uproot3-methods==0.10.1
 xgboost>=1.7.0
+pennylane>=0.30.0
 zipp==3.6.0

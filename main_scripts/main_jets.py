@@ -25,6 +25,7 @@ os.chdir(project_dir)
 # Project dependencies
 from models.set_to_graph import SetToGraph
 from models.bdt_model import BDTVertexFinder
+from models.quantum_model import QuantumAngleEmbedding
 from dataloaders import jets_loader
 from performance_eval.eval_test_jets import eval_jets_on_test_set
 
@@ -36,7 +37,7 @@ def parse_args():
     argparser.add_argument('-e', '--epochs', default=400, type=int, help='The number of epochs to run')
     argparser.add_argument('-l', '--lr', default=0.001, type=float, help='The learning rate')
     argparser.add_argument('-b', '--bs', default=2048, type=int, help='Batch size to use')
-    argparser.add_argument('--method', default='lin2', help='Method to transfer from sets to graphs: lin2 for S2G, lin5 for S2G+, bdt for BDT')
+    argparser.add_argument('--method', default='lin2', help='Method to transfer from sets to graphs: lin2 for S2G, lin5 for S2G+, bdt for BDT, quantum for Quantum Angle Embedding')
     argparser.add_argument('--res_dir', default='experiments/jets_results', help='Results directory')
     argparser.add_argument('--debug_load', dest='debug_load', action='store_true', help='Load only a small subset of the data')
     argparser.add_argument('--save', dest='save', action='store_true', help='Whether to save all to disk')
@@ -44,6 +45,9 @@ def parse_args():
     argparser.add_argument('--bdt_n_estimators', default=100, type=int, help='Number of boosting rounds for BDT')
     argparser.add_argument('--bdt_max_depth', default=6, type=int, help='Max depth of trees for BDT')
     argparser.add_argument('--bdt_lr', default=0.1, type=float, help='Learning rate for BDT')
+    argparser.add_argument('--quantum_n_qubits', default=10, type=int, help='Number of qubits for quantum circuit')
+    argparser.add_argument('--quantum_n_layers', default=3, type=int, help='Number of layers in quantum circuit')
+    argparser.add_argument('--quantum_lr', default=0.01, type=float, help='Learning rate for quantum model')
     argparser.set_defaults(save=True, debug_load=False)
     return argparser.parse_args()
 
@@ -105,23 +109,24 @@ def do_epoch(data, model, optimizer=None):
     start_time = datetime.now()
     accum_info = {k: 0.0 for k in ['ri', 'loss', 'accuracy', 'fscore', 'precision', 'recall', 'insts']}
     
-    # Detectar si es BDT
+    # Detectar si es BDT o Quantum
     is_bdt = isinstance(model, BDTVertexFinder)
+    is_quantum = isinstance(model, QuantumAngleEmbedding)
     
     for sets, partitions, partitions_as_graph in data:
         sets, partitions, partitions_as_graph = sets.to(DEVICE), partitions.to(DEVICE), partitions_as_graph.to(DEVICE)
         batch_size = sets.shape[0]
 
-        # Entrenar BDT si es necesario
-        if is_bdt and optimizer is not None:  # Solo en modo entrenamiento
+        # Entrenar BDT o Quantum si es necesario
+        if (is_bdt or is_quantum) and optimizer is not None:  # Solo en modo entrenamiento
             model.fit_batch(sets, partitions_as_graph)
         
         edge_vals = model(sets).squeeze(1)
         pred_partitions = infer_clusters(edge_vals)
         loss = get_loss(edge_vals, partitions_as_graph)
 
-        # Solo hacer backward si no es BDT
-        if optimizer and not is_bdt:
+        # Solo hacer backward si no es BDT ni Quantum
+        if optimizer and not is_bdt and not is_quantum:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -130,8 +135,8 @@ def do_epoch(data, model, optimizer=None):
         accum_info['loss'] += loss.item() * batch_size
         accum_info['insts'] += batch_size
 
-    # Entrenar BDT después de acumular todos los batches
-    if is_bdt and optimizer is not None:
+    # Entrenar BDT o Quantum después de acumular todos los batches
+    if (is_bdt or is_quantum) and optimizer is not None:
         model.train_model()
     
     num_insts = accum_info.pop('insts')
@@ -155,6 +160,17 @@ def main():
     train_data = jets_loader.get_data_loader('train', config.bs, config.debug_load)
     print('Loading validation data...', end='', flush=True)
     val_data = jets_loader.get_data_loader('validation', config.bs, config.debug_load)
+    
+    # Reducir aún más el dataset para métodos cuánticos en modo debug
+    if config.debug_load and config.method == 'quantum':
+        # Limitar a pocos batches para acelerar debugging
+        train_data_list = list(train_data)[:2]  # Solo 2 batches de entrenamiento
+        val_data_list = list(val_data)[:1]      # Solo 1 batch de validación
+        print(f'\nDEBUG MODE (Quantum): Reduced to {len(train_data_list)} train batches, {len(val_data_list)} val batches')
+        
+        # Convertir de vuelta a iterable
+        train_data = train_data_list
+        val_data = val_data_list
 
     # Create model instance
     if config.method == 'bdt':
@@ -166,6 +182,15 @@ def main():
         )
         num_params = 0  # BDT no tiene parámetros entrenables en el sentido de PyTorch
         print(f'BDT model created with {config.bdt_n_estimators} estimators')
+    elif config.method == 'quantum':
+        print('Creating Quantum Angle Embedding model...')
+        model = QuantumAngleEmbedding(
+            n_qubits=config.quantum_n_qubits,
+            n_layers=config.quantum_n_layers,
+            learning_rate=config.quantum_lr
+        )
+        num_params = config.quantum_n_qubits * config.quantum_n_layers * 3  # Parámetros del circuito
+        print(f'Quantum model created with {config.quantum_n_qubits} qubits, {config.quantum_n_layers} layers ({num_params} parameters)')
     else:
         model = SetToGraph(10,
                            out_features=1,
@@ -181,7 +206,7 @@ def main():
     model = model.to(DEVICE)
 
     # Optimizer (solo para GNN)
-    optimizer = None if config.method == 'bdt' else torch.optim.Adam(params=model.parameters(), lr=config.lr)
+    optimizer = None if config.method in ['bdt', 'quantum'] else torch.optim.Adam(params=model.parameters(), lr=config.lr)
 
     # Metrics
     train_loss, train_ri = np.empty(config.epochs), np.empty(config.epochs)
@@ -191,8 +216,8 @@ def main():
 
     # Training and evaluation process
     for epoch in range(1, config.epochs + 1):
-        # Para BDT, pasar "dummy optimizer" para indicar modo entrenamiento
-        train_optimizer = True if config.method == 'bdt' else optimizer
+        # Para BDT o Quantum, pasar "dummy optimizer" para indicar modo entrenamiento
+        train_optimizer = True if config.method in ['bdt', 'quantum'] else optimizer
         train_info = do_epoch(train_data, model, train_optimizer)
         print(f"\tTraining - {epoch:4} loss:{train_info['loss']:.6f} -- mean_ri:{train_info['ri']:.4f} -- fscore:{train_info['fscore']:.4f} -- recall:{train_info['recall']:.4f} -- precision:{train_info['precision']:.4f} -- runtime:{train_info['run_time']}", flush=True)
         train_loss[epoch-1], train_ri[epoch-1] = train_info['loss'], train_info['ri']
