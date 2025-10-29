@@ -254,3 +254,36 @@ class QuantumAngleEmbedding:
         """Compatibilidad con device management"""
         self.device = device
         return self
+    
+    def state_dict(self):
+        """Retorna el estado del modelo para guardado"""
+        return {
+            'params': self.params,
+            'n_qubits': self.n_qubits,
+            'n_layers': self.n_layers,
+            'learning_rate': self.learning_rate,
+            'trained_epochs': self.trained_epochs
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Carga el estado del modelo"""
+        self.params = state_dict['params']
+        self.n_qubits = state_dict['n_qubits']
+        self.n_layers = state_dict['n_layers']
+        self.learning_rate = state_dict['learning_rate']
+        self.trained_epochs = state_dict.get('trained_epochs', 0)
+        
+        # Recrear el dispositivo y QNode con los nuevos parámetros
+        self.dev = qml.device('default.qubit', wires=self.n_qubits)
+        self.qnode = qml.QNode(self._quantum_circuit, self.dev, interface='autograd')
+    
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Crea una instancia del modelo desde un state_dict"""
+        model = cls(
+            n_qubits=state_dict['n_qubits'],
+            n_layers=state_dict['n_layers'],
+            learning_rate=state_dict['learning_rate']
+        )
+        model.load_state_dict(state_dict)
+        return model

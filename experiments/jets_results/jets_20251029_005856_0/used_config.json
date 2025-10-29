@@ -1,0 +1,1 @@
+{"epochs": 30, "lr": 0.001, "bs": 2048, "method": "quantum", "res_dir": "experiments/jets_results", "debug_load": true, "save": true, "bdt_n_estimators": 100, "bdt_max_depth": 6, "bdt_lr": 0.1, "quantum_n_qubits": 10, "quantum_n_layers": 3, "quantum_lr": 0.01}
