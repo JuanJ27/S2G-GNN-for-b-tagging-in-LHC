@@ -24,6 +24,7 @@ os.chdir(project_dir)
 
 # Project dependencies
 from models.set_to_graph import SetToGraph
+from models.bdt_model import BDTVertexFinder
 from dataloaders import jets_loader
 from performance_eval.eval_test_jets import eval_jets_on_test_set
 
@@ -35,11 +36,14 @@ def parse_args():
     argparser.add_argument('-e', '--epochs', default=400, type=int, help='The number of epochs to run')
     argparser.add_argument('-l', '--lr', default=0.001, type=float, help='The learning rate')
     argparser.add_argument('-b', '--bs', default=2048, type=int, help='Batch size to use')
-    argparser.add_argument('--method', default='lin2', help='Method to transfer from sets to graphs: lin2 for S2G, lin5 for S2G+')
+    argparser.add_argument('--method', default='lin2', help='Method to transfer from sets to graphs: lin2 for S2G, lin5 for S2G+, bdt for BDT')
     argparser.add_argument('--res_dir', default='experiments/jets_results', help='Results directory')
     argparser.add_argument('--debug_load', dest='debug_load', action='store_true', help='Load only a small subset of the data')
     argparser.add_argument('--save', dest='save', action='store_true', help='Whether to save all to disk')
     argparser.add_argument('--no_save', dest='save', action='store_false')
+    argparser.add_argument('--bdt_n_estimators', default=100, type=int, help='Number of boosting rounds for BDT')
+    argparser.add_argument('--bdt_max_depth', default=6, type=int, help='Max depth of trees for BDT')
+    argparser.add_argument('--bdt_lr', default=0.1, type=float, help='Learning rate for BDT')
     argparser.set_defaults(save=True, debug_load=False)
     return argparser.parse_args()
 
@@ -100,15 +104,24 @@ def do_epoch(data, model, optimizer=None):
     model.train() if optimizer else model.eval()
     start_time = datetime.now()
     accum_info = {k: 0.0 for k in ['ri', 'loss', 'accuracy', 'fscore', 'precision', 'recall', 'insts']}
+    
+    # Detectar si es BDT
+    is_bdt = isinstance(model, BDTVertexFinder)
+    
     for sets, partitions, partitions_as_graph in data:
         sets, partitions, partitions_as_graph = sets.to(DEVICE), partitions.to(DEVICE), partitions_as_graph.to(DEVICE)
         batch_size = sets.shape[0]
 
+        # Entrenar BDT si es necesario
+        if is_bdt and optimizer is not None:  # Solo en modo entrenamiento
+            model.fit_batch(sets, partitions_as_graph)
+        
         edge_vals = model(sets).squeeze(1)
         pred_partitions = infer_clusters(edge_vals)
         loss = get_loss(edge_vals, partitions_as_graph)
 
-        if optimizer:
+        # Solo hacer backward si no es BDT
+        if optimizer and not is_bdt:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -117,6 +130,10 @@ def do_epoch(data, model, optimizer=None):
         accum_info['loss'] += loss.item() * batch_size
         accum_info['insts'] += batch_size
 
+    # Entrenar BDT después de acumular todos los batches
+    if is_bdt and optimizer is not None:
+        model.train_model()
+    
     num_insts = accum_info.pop('insts')
     for key in accum_info:
         accum_info[key] /= num_insts
@@ -140,20 +157,31 @@ def main():
     val_data = jets_loader.get_data_loader('validation', config.bs, config.debug_load)
 
     # Create model instance
-    model = SetToGraph(10,
-                       out_features=1,
-                       set_fn_feats=[256, 256, 256, 256, 5],
-                       method=config.method,
-                       hidden_mlp=[256],
-                       predict_diagonal=False,
-                       attention=True,
-                       set_model_type='deepset')
+    if config.method == 'bdt':
+        print('Creating BDT model...')
+        model = BDTVertexFinder(
+            n_estimators=config.bdt_n_estimators,
+            max_depth=config.bdt_max_depth,
+            learning_rate=config.bdt_lr
+        )
+        num_params = 0  # BDT no tiene parámetros entrenables en el sentido de PyTorch
+        print(f'BDT model created with {config.bdt_n_estimators} estimators')
+    else:
+        model = SetToGraph(10,
+                           out_features=1,
+                           set_fn_feats=[256, 256, 256, 256, 5],
+                           method=config.method,
+                           hidden_mlp=[256],
+                           predict_diagonal=False,
+                           attention=True,
+                           set_model_type='deepset')
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'The number of model parameters is {num_params}')
+    
     model = model.to(DEVICE)
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'The number of model parameters is {num_params}')
 
-    # Optimizer
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=config.lr)
+    # Optimizer (solo para GNN)
+    optimizer = None if config.method == 'bdt' else torch.optim.Adam(params=model.parameters(), lr=config.lr)
 
     # Metrics
     train_loss, train_ri = np.empty(config.epochs), np.empty(config.epochs)
@@ -163,7 +191,9 @@ def main():
 
     # Training and evaluation process
     for epoch in range(1, config.epochs + 1):
-        train_info = do_epoch(train_data, model, optimizer)
+        # Para BDT, pasar "dummy optimizer" para indicar modo entrenamiento
+        train_optimizer = True if config.method == 'bdt' else optimizer
+        train_info = do_epoch(train_data, model, train_optimizer)
         print(f"\tTraining - {epoch:4} loss:{train_info['loss']:.6f} -- mean_ri:{train_info['ri']:.4f} -- fscore:{train_info['fscore']:.4f} -- recall:{train_info['recall']:.4f} -- precision:{train_info['precision']:.4f} -- runtime:{train_info['run_time']}", flush=True)
         train_loss[epoch-1], train_ri[epoch-1] = train_info['loss'], train_info['ri']
 

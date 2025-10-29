@@ -1,0 +1,1 @@
+{"epochs": 30, "lr": 0.001, "bs": 2048, "method": "lin5", "res_dir": "experiments/jets_results", "debug_load": true, "save": true, "bdt_n_estimators": 100, "bdt_max_depth": 6, "bdt_lr": 0.1}
