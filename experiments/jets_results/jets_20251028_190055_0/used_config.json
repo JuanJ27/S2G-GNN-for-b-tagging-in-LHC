@@ -1,0 +1,1 @@
+{"epochs": 2, "lr": 0.001, "bs": 2048, "method": "lin2", "res_dir": "experiments/jets_results", "debug_load": true, "save": true}
